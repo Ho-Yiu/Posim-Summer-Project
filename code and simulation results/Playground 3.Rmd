@@ -1,0 +1,1031 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+## Import libraries
+
+# save default plot params so we can reset the plot window
+
+gpars<-par()
+i=match(c("cin","cra","csi","cxy","din","page"),names(gpars))
+gpars<-gpars[-i]
+
+# load libraries
+
+library(MASS)
+library(mnem)       # needed for transitive.reduction/closure
+library(igraph) 
+library(Rgraphviz)
+library(graph) 
+library(coda)       # for MCMC output analysis
+library(lecount)    # count linear extensions of a PO
+library(partitions) # used by dimension functions
+library(parallel)
+
+#replace this with your working directory
+#wd<-
+#setwd(wd)
+
+# load function files
+
+source(file="pofun.R")
+source(file="pofun_aux.R")
+source(file="modelfun.R")
+source(file="dimfun.R")
+source(file="my_code.R")
+```
+
+Runtime plots
+```{r}
+set.seed(10)
+results2 <- vector("list",3)
+for (i in 1:3){
+  results2[[i]] <- vector("list",8)
+}
+time.spent <- matrix(0,3,8,dimnames = list(10*(1:3),5*(1:8)))
+
+library(parallel)
+
+cl <- makeCluster(min(24,detectCores() - 1))
+
+
+# load libraries and source files on each worker
+clusterEvalQ(cl, {
+  library(MASS)
+  library(mnem)       # needed for transitive.reduction/closure
+  library(igraph) 
+  library(Rgraphviz)
+  library(graph) 
+  library(coda)       # for MCMC output analysis
+  library(lecount)    # count linear extensions of a PO
+  library(partitions) # used by dimension functions
+  
+  setwd(getwd())
+  
+  source(file="pofun.R")
+  source(file="pofun_aux.R")
+  source(file="modelfun.R")
+  source(file="dimfun.R")
+  source(file="my_code.R")
+  source(file="code data.R")
+})
+
+
+# independent random-number streams
+clusterSetRNGStream(cl, 10)
+
+
+# create all 24 combinations of i and j
+jobs <- expand.grid(
+  i = 1:8,
+  j = 1:3
+)
+
+N <- 30
+
+m <- mc <- b <- vector("list",8)
+
+for (i in 1:8){
+  m[[i]] <- rZPO(5*i)
+  mc[[i]] <- my.transitive.closure(m[[i]])
+  b[[i]] <- rgeom.bucket.from.po(mc[[i]],n.samples = N,p=.5,suborder=T,noise.prob = .02);
+}
+
+
+clusterExport(cl, c("jobs","m","mc","b"))
+
+results2p <- parLapply(cl, 1:nrow(jobs), function(k){
+  
+  i <- jobs$i[k]
+  j <- jobs$j[k]
+  
+  n <- as.integer(5*i); burn <- 0; thin <- 1; n.samples <- 1e4; p <- 0.02
+  
+  start.time <- Sys.time()
+  out <- rposterior.bucket(n=n, b=b[[i]][1:(10*j)], n.samples=n.samples, burn=burn, thin=thin, draw=F, return.lsm = T, r=.5, noise.prob =p) 
+  end.time <- Sys.time()
+  
+  time <- as.numeric(difftime(end.time, start.time, units="secs"))
+  
+  list(
+    i=i,
+    j=j,
+    out=out,
+    time=time
+  )
+})
+
+
+# put results back into original 3 x 8 structure
+for (k in 1:length(results2p)){
+  
+  i <- results2p[[k]]$i
+  j <- results2p[[k]]$j
+  
+  results2[[j]][[i]] <- results2p[[k]]$out
+  time.spent[j,i] <- results2p[[k]]$time
+  
+}
+
+stopCluster(cl)
+```
+
+
+4.1, 4.2
+```{r}
+#Distance Frequency plot
+max.ham <- max(sapply(result3.data$ham,function(x) max(as.numeric(names(x)))))
+ham.dist.mat <- matrix(0,8,max.ham+1)
+
+for (i in 1:8){
+  lab <- as.numeric(names(result3.data$ham[[i]]))
+  ham.dist.mat[i,lab+1] <- as.numeric(result3.data$ham[[i]])
+}
+
+plot(0:max.ham,ham.dist.mat[1,],type="l",xlim=c(0,max.ham),col=adjustcolor("black",alpha.f=.4),ylab="Frequency",xlab="Hamming distance",ylim=c(0,40000))
+for (i in 2:8){
+  lines(0:max.ham,ham.dist.mat[i,],col=adjustcolor("black",alpha.f=.4))
+}
+title("Frequency of Hamming distance to true partial order")
+
+#Hamming dist plot
+p <- 0
+v <- matrix(0,8,101)
+for (k in 1:8){
+  meanpo <- result3.data$mean[[k]]
+  for (i in 0:100){
+    v[k,i+1] <- hamming.dist(consensus.po2(meanpo,i/100),code1.m)
+  }
+  if (k==1) plot((0:100)/100,v[k,],type="l",ylab="hamming dist",xlab="p",col=adjustcolor("black",alpha.f=.7))
+  if (k!=1) lines((0:100)/100,v[k,],type="l",col=adjustcolor("black",alpha.f=.7))
+  title("Hamming dist of 8 p-consensus against p")
+  opt.p <- (which(v[k,]==min(v[k,]))-1)/100
+  opt.range <- c(min(opt.p),max(opt.p))
+  min.dist <- v[k,][opt.p[1]*100+1]
+  p <- p + max(opt.p)/8
+  cat(c("\n At i=",k,", minimum dist is last achieved at p=",max(opt.p),", where the hamming distance is",min.dist,". \n At p=1/3, the hamming dist is ",v[k,34],"."))
+}
+cat(c("\n average maximal opt p is ",p))
+
+#ESS
+#took 1.73 hours to run :(
+st <- Sys.time()
+
+burn <- 1e5
+n.samples <- 1e6
+sample.ind <- (burn + 1):n.samples
+
+ess.list <- vector("list", 8)
+min.ess <- numeric(8)
+
+for (k in 1:8) {
+
+  samples <- result3$out[[k]]$samples
+
+  ess <- matrix(Inf, n, n)
+
+  for (i in 1:n) {
+    for (j in 1:n) {
+      
+      print(c(i,j,k))
+      if (i == j)
+        next
+
+      v <- vapply(
+        sample.ind,
+        function(t) samples[[t]][i,j],
+        numeric(1)
+      )
+
+      if (var(v) != 0)
+        ess[i,j] <- effectiveSize(v)
+    }
+  }
+
+  ess.list[[k]] <- ess
+  min.ess[k] <- min(ess)
+
+}
+
+et <- Sys.time()
+timepassed <- et - st
+```
+
+
+
+4.3
+```{r}
+## Import libraries
+
+# save default plot params so we can reset the plot window
+gpars<-par()
+i=match(c("cin","cra","csi","cxy","din","page"),names(gpars))
+gpars<-gpars[-i]
+
+# load libraries
+library(MASS)
+library(mnem)       # needed for transitive.reduction/closure
+library(igraph) 
+library(Rgraphviz)
+library(graph) 
+library(coda)       # for MCMC output analysis
+library(lecount)    # count linear extensions of a PO
+library(partitions) # used by dimension functions
+library(parallel)
+
+#working directory
+#wd<-#"C:/Users/oweny_djchlla/OneDrive/Desktop/Posim 2 simulation"
+#setwd(wd)
+
+# load function files
+source(file="pofun.R")
+source(file="pofun_aux.R")
+source(file="modelfun.R")
+source(file="dimfun.R")
+source(file="my_code.R")
+source(file="code data.R")
+```
+
+Generating data
+```{r}
+#n=10
+n <- 10L; N <- 40; burn <- 1e5; thin <- 1; n.samples <- 1e6; p <- 0.05
+
+#m <- rZPO(n)
+m <- matrix(c(0,0,0,1,0,0,1,1,0,1,1,0,1,1,0,0,1,1,0,1,1,0,0,1,0,0,1,1,0,1,0,0,0,0,0,0,0,0,0,0,1,0,1,1,0,0,1,1,0,1,1,1,1,1,0,0,1,1,1,1,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,1,0,0,1,1,0,1,0,0,0,0,0,0,0,1,0,0), nrow=10, byrow=TRUE)
+mc <- my.transitive.closure(m); mr <- transitive.reduction(m)
+showDAG(t(mr)); title(paste(c("depth =",dag.depth(mr,10)),collapse = " "))
+
+true.po.10 <- m
+buckets.10 <- rgeom.bucket.from.po(mc,n.samples = N,p=.5,suborder=T,noise.prob = p)
+
+#n=20
+n <- 20L; N <- 40; burn <- 1e5; thin <- 1; n.samples <- 1e6; p <- 0.05
+
+#m <- rZPO(n)
+m <- matrix(c(0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,1,0,0,0,1,0,1,0,1,1,0,0,1,1,0,1,1,1,1,0,1,0,1,1,1,0,0,0,1,0,0,0,1,1,0,1,1,1,1,0,1,0,1,1,1,0,1,0,0,0,1,1,0,0,1,0,1,0,1,1,1,1,1,1,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,1,0,1,1,1,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,1,0,0,0,1,1,1,0,1,1,0,0,1,1,0,1,1,1,1,0,1,0,1,1,1,0,0,0,0,0,0,0,0,1,1,0,0,1,0,1,0,1,0,0,0,0,0,0,0,1,0,0,1,0,0,0,0,0,0,0,0,0,1,0,0,1,0,0,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,1,1,0,0,1,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,1,0,1,1,0,0,1,1,0,1,1,1,1,0,1,0,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,1,1,0,0,1,0,1,0,1,0,1,0,1,1,0,0,1,1,0,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,1,1,0,0,1,0,1,0,1,0), nrow=20, byrow=TRUE)
+mc <- my.transitive.closure(m); mr <- transitive.reduction(m)
+showDAG(t(mr)); title(paste(c("depth =",dag.depth(mr,20)),collapse = " "))
+
+true.po.20 <- m
+buckets.20 <- rgeom.bucket.from.po(mc,n.samples = N,p=.5,suborder=T,noise.prob = p)
+
+#n=30
+n <- 30L; N <- 40; burn <- 1e5; thin <- 1; n.samples <- 1e6; p <- 0.05
+
+#m <- rZPO(n)
+m <- rbind(c(0,1,1,0,0,1,0,1,1,1,0,0,1,1,1,0,0,1,1,1,1,1,0,0,1,0,1,0,1,1),c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0),c(0,1,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0),c(1,1,1,0,0,1,0,1,1,1,0,0,1,1,1,0,1,1,1,1,1,1,0,1,1,1,1,0,1,1),c(1,1,1,0,0,1,0,1,1,1,1,0,1,1,1,0,1,1,1,1,1,1,0,1,1,1,1,0,1,1),c(0,1,1,0,0,0,0,1,1,1,0,0,1,0,0,0,0,0,1,0,1,0,0,0,0,0,0,0,0,1),c(1,1,1,0,0,1,0,1,1,1,1,0,1,1,1,0,1,1,1,1,1,1,0,1,1,1,1,0,1,1),c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0),c(0,1,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0),c(0,1,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0),c(0,1,1,0,0,1,0,1,1,1,0,0,1,1,1,0,0,1,1,1,1,1,0,0,1,0,1,0,1,1),c(1,1,1,1,1,1,1,1,1,1,1,0,1,1,1,1,1,1,1,1,1,1,0,1,1,1,1,1,1,1),c(0,1,1,0,0,0,0,1,1,1,0,0,0,0,0,0,0,0,1,0,1,0,0,0,0,0,0,0,0,1),c(0,1,1,0,0,1,0,1,1,1,0,0,1,0,1,0,0,0,1,1,1,1,0,0,0,0,0,0,0,1),c(0,1,1,0,0,0,0,1,1,1,0,0,1,0,0,0,0,0,1,0,1,0,0,0,0,0,0,0,0,1),c(1,1,1,0,0,1,0,1,1,1,1,0,1,1,1,0,1,1,1,1,1,1,0,1,1,1,1,0,1,1),c(0,1,1,0,0,1,0,1,1,1,0,0,1,1,1,0,0,1,1,1,1,1,0,0,1,0,1,0,1,1),c(0,1,1,0,0,0,0,1,1,1,0,0,1,0,0,0,0,0,1,1,1,0,0,0,0,0,0,0,0,1),c(0,1,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0),c(0,1,1,0,0,0,0,1,1,1,0,0,1,0,0,0,0,0,1,0,1,0,0,0,0,0,0,0,0,1),c(0,1,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0),c(0,1,1,0,0,0,0,1,1,1,0,0,1,0,0,0,0,0,1,0,1,0,0,0,0,0,0,0,0,1),c(1,1,1,1,1,1,1,1,1,1,1,0,1,1,1,1,1,1,1,1,1,1,0,1,1,1,1,1,1,1),c(0,1,1,0,0,1,0,1,1,1,0,0,1,1,1,0,0,1,1,1,1,1,0,0,1,0,1,0,1,1),c(0,1,1,0,0,1,0,1,1,1,0,0,1,0,1,0,0,1,1,1,1,1,0,0,0,0,0,0,0,1),c(0,1,1,0,0,1,0,1,1,1,0,0,1,1,1,0,0,1,1,1,1,1,0,0,1,0,1,0,1,1),c(0,1,1,0,0,0,0,1,1,1,0,0,1,0,0,0,0,0,1,1,1,1,0,0,0,0,0,0,0,1),c(1,1,1,0,0,1,0,1,1,1,1,0,1,1,1,0,1,1,1,1,1,1,0,1,1,1,1,0,1,1),c(0,1,1,0,0,1,0,1,1,1,0,0,1,0,1,0,0,1,1,1,1,1,0,0,0,0,0,0,0,1),c(0,1,0,0,0,0,0,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)); rownames(m) <- colnames(m) <- 1:30
+mc <- my.transitive.closure(m); mr <- transitive.reduction(m)
+showDAG(t(mr)); title(paste(c("depth =",dag.depth(mr,30)),collapse = " "))
+
+true.po.30 <- m
+buckets.30 <- rgeom.bucket.from.po(mc,n.samples = N,p=.5,suborder=T,noise.prob = p)
+
+#empty po
+n <- 24L; N <- 30; burn <- 1e5; thin <- 1; n.samples <- 1e6; p <- 0.05
+empty.po <- matrix(0, nrow=n, ncol=n, byrow=TRUE, dimnames = list(1:n,1:n))
+buckets.emp <- rgeom.bucket.from.po(empty.po,n.samples = N,p=.5,suborder=T,noise.prob = p)
+
+#total order
+n <- 24L
+total.order <- seqtodag(1:n,n); rownames(total.order) <- colnames(total.order) <- 1:n
+buckets.total <- rgeom.bucket.from.po(total.order,n.samples = N,p=.5,suborder=T,noise.prob = p)
+
+```
+
+```{r}
+n <- 24L; N <- 30; burn <- 1e4; thin <- 1; n.samples <- 1e5; p <- 0.05
+
+cl <- makeCluster(20)
+
+clusterExport(cl,c("n","N","burn","thin","n.samples","p"))
+
+clusterEvalQ(cl,{
+  library(MASS)
+  library(mnem)
+  library(igraph)
+  library(Rgraphviz)
+  library(graph)
+  library(coda)
+  library(lecount)
+  library(partitions)
+  
+  setwd(getwd())
+  
+  source(file="pofun.R")
+  source(file="pofun_aux.R")
+  source(file="modelfun.R")
+  source(file="dimfun.R")
+  source(file="my_code.R")
+  source(file="code data.R")
+  
+  check.dag <- function(mc){!any(mc+t(mc)==2)}
+})
+
+clusterSetRNGStream(cl,10)
+
+true.po <- parLapply(cl,1:10,function(j){
+  m <- rZPO(n)
+  my.transitive.closure(m)
+})
+
+clusterExport(cl,c("n","N","burn","thin","n.samples","p","true.po"))
+
+result <- parLapply(cl,1:20,function(j){
+  
+  if (j <= 10){
+    mc <- true.po[[j]]
+  } else {
+    mc <- t(true.po[[j-10]])
+  }
+  
+  b <- rgeom.bucket.from.po(mc,n.samples=N,p=.5,suborder=T,noise.prob=p)
+  
+  chain <- rposterior.bucket.mean(n=n,b=b,n.samples=n.samples,burn=burn,thin=thin,draw=F,return.lsm=T,r=.5,noise.prob=p)
+  
+  pos.po <- chain$mean
+  
+  ham.dist <- numeric(101)
+  
+  for (i in 0:100){
+    q.consensus <- consensus.po2(pos.po,p=i/100)
+    
+    if (check.dag(q.consensus)){
+      ham.dist[i+1] <- hamming.dist(q.consensus,mc)/(n*(n-1)/2+sum(mc))
+    } else {
+      ham.dist[i+1] <- NA
+    }
+  }
+  
+  ham.dist
+})
+
+stopCluster(cl)
+
+result <- do.call(rbind,result)
+```
+
+```{r}
+p.values <- (0:100)/100
+
+plot(p.values,result[1,],type="l",xlab="p",ylab="Relative Hamming distance",ylim=range(result,na.rm=T),col=adjustcolor(1,alpha=.85))
+
+for (i in 1:10){
+  lines(p.values,result[i,],col=adjustcolor(i,alpha=.85))
+  lines(p.values,result[i+10,],col=adjustcolor(i,alpha=.85))
+}
+```
+
+
+20 chains targeting different h_0
+```{r}
+n <- 24L; N <- 30; burn <- 1e5; thin <- 1; n.samples <- 1e6; p <- 0.05
+
+cl <- makeCluster(20)
+
+clusterExport(cl,c("n","N","burn","thin","n.samples","p"))
+
+clusterEvalQ(cl,{
+  library(MASS)
+  library(mnem)
+  library(igraph)
+  library(Rgraphviz)
+  library(graph)
+  library(coda)
+  library(lecount)
+  library(partitions)
+  
+  setwd(getwd())
+  
+  source(file="pofun.R")
+  source(file="pofun_aux.R")
+  source(file="modelfun.R")
+  source(file="dimfun.R")
+  source(file="my_code.R")
+  source(file="code data.R")
+  
+  check.dag <- function(mc){!any(mc+t(mc)==2)}
+})
+
+clusterSetRNGStream(cl,11)
+
+result <- parLapply(cl,1:20,function(j){
+  
+  m <- rZPO(n)
+  mc <- my.transitive.closure(m)
+  mr <- transitive.reduction(m)
+  
+  b <- rgeom.bucket.from.po(mc,n.samples=N,p=.5,suborder=T,noise.prob=p)
+  
+  m0 <- rZPO(n)
+  chain <- rposterior.bucket.mean(n=n,b=b,n.samples=n.samples,burn=burn,thin=thin,draw=F,return.lsm=T,r=.5,noise.prob=p,m=m0)
+  
+  pos.po <- chain$mean
+  
+  ham.dist <- numeric(101)
+  
+  for (i in 0:100){
+    q.consensus <- consensus.po2(pos.po,p=i/100)
+    
+    if (check.dag(q.consensus)){
+      ham.dist[i+1] <- hamming.dist(q.consensus,mc)/(n*(n-1)/2+sum(mc))
+    } else {
+      ham.dist[i+1] <- NA
+    }
+  }
+  
+  ham.dist
+})
+
+stopCluster(cl)
+
+result <- do.call(rbind,result)
+```
+
+```{r}
+jpeg("20_relative_hamming_distance.jpeg",width=1800,height=1200,res=200)
+
+p.values <- (0:100)/100
+
+plot(p.values,result[1,],type="l",xlab="q",ylab="Relative Hamming distance",ylim=range(result,na.rm=T),col=adjustcolor(1,alpha=.85))
+
+for (i in 2:nrow(result)){
+  lines(p.values,result[i,],col=adjustcolor(i,alpha=.85))
+}
+
+dev.off()
+```
+
+
+
+Simulations for relative hamming dist vs N 
+```{r}
+#m=10
+n <- 10L; N <- 40; burn <- 1e4; thin <- 1; n.samples <- 1e5; p <- 0.05
+
+cl <- makeCluster(10)
+
+clusterEvalQ(cl, {
+  library(MASS)
+  library(mnem)       # needed for transitive.reduction/closure
+  library(igraph) 
+  library(Rgraphviz)
+  library(graph) 
+  library(coda)       # for MCMC output analysis
+  library(lecount)    # count linear extensions of a PO
+  library(partitions) # used by dimension functions
+  
+  setwd(getwd())
+  
+  source(file="pofun.R")
+  source(file="pofun_aux.R")
+  source(file="modelfun.R")
+  source(file="dimfun.R")
+  source(file="my_code.R")
+  source(file="code data.R")
+})
+
+
+clusterExport(cl, c("n","N","burn","thin","n.samples","p","buckets.10","true.po.10"))
+
+ham.dist.10.all <- parLapply(cl, 1:10, function(j){
+  
+  q.consensus.10 <- vector("list",8)
+  pos.po.10 <- vector("list",8)
+  ham.dist.10 <- numeric(8)
+  
+  for (i in 1:8){
+    chain.10 <- rposterior.bucket(n=n, b=buckets.10[1:(5*i)], n.samples=n.samples, burn=burn, thin=thin, draw=F, return.lsm=T, r=.5, noise.prob=p)
+    pos.po.10[[i]] <- mean.po(chain.10$samples)
+    q.consensus.10[[i]] <- consensus.po2(pos.po.10[[i]],p=0.5)
+    ham.dist.10[i] <- hamming.dist(q.consensus.10[[i]],true.po.10)
+  }
+  
+  ham.dist.10
+})
+
+stopCluster(cl)
+
+ham.dist.10.all <- do.call(rbind,ham.dist.10.all)
+
+
+ham.mean.10 <- apply(ham.dist.10.all,2,mean)
+ham.sd.10 <- apply(ham.dist.10.all,2,sd)
+ham.se.10 <- ham.sd.10/sqrt(10)
+
+ham.lower.10 <- ham.mean.10-qt(.975,9)*ham.se.10
+ham.upper.10 <- ham.mean.10+qt(.975,9)*ham.se.10
+
+#m=20
+n <- 20L; N <- 40; burn <- 1e4; thin <- 1; n.samples <- 1e5; p <- 0.05
+
+cl <- makeCluster(10)
+
+clusterExport(cl, c("n","N","burn","thin","n.samples","p","buckets.20","true.po.20"))
+
+clusterEvalQ(cl, {
+  library(MASS)
+  library(mnem)       # needed for transitive.reduction/closure
+  library(igraph) 
+  library(Rgraphviz)
+  library(graph) 
+  library(coda)       # for MCMC output analysis
+  library(lecount)    # count linear extensions of a PO
+  library(partitions) # used by dimension functions
+  
+  setwd(getwd())
+  
+  source(file="pofun.R")
+  source(file="pofun_aux.R")
+  source(file="modelfun.R")
+  source(file="dimfun.R")
+  source(file="my_code.R")
+  source(file="code data.R")
+})
+
+
+ham.dist.20.all <- parLapply(cl, 1:10, function(j){
+  
+  q.consensus.20 <- vector("list",8)
+  pos.po.20 <- vector("list",8)
+  ham.dist.20 <- numeric(8)
+  
+  for (i in 1:8){
+    chain.20 <- rposterior.bucket(n=n, b=buckets.20[1:(5*i)], n.samples=n.samples, burn=burn, thin=thin, draw=F, return.lsm=T, r=.5, noise.prob=p)
+    pos.po.20[[i]] <- mean.po(chain.20$samples)
+    q.consensus.20[[i]] <- consensus.po2(pos.po.20[[i]],p=0.5)
+    ham.dist.20[i] <- hamming.dist(q.consensus.20[[i]],true.po.20)
+  }
+  
+  ham.dist.20
+})
+
+stopCluster(cl)
+
+ham.dist.20.all <- do.call(rbind,ham.dist.20.all)
+
+
+ham.mean.20 <- apply(ham.dist.20.all,2,mean)
+ham.sd.20 <- apply(ham.dist.20.all,2,sd)
+ham.se.20 <- ham.sd.20/sqrt(10)
+
+ham.lower.20 <- ham.mean.20-qt(.975,9)*ham.se.20
+ham.upper.20 <- ham.mean.20+qt(.975,9)*ham.se.20
+
+#m=30
+n <- 30L; N <- 40; burn <- 1e4; thin <- 1; n.samples <- 1e5; p <- 0.05
+
+cl <- makeCluster(10)
+
+clusterExport(cl, c("n","N","burn","thin","n.samples","p","buckets.30","true.po.30"))
+
+clusterEvalQ(cl, {
+  library(MASS)
+  library(mnem)       # needed for transitive.reduction/closure
+  library(igraph) 
+  library(Rgraphviz)
+  library(graph) 
+  library(coda)       # for MCMC output analysis
+  library(lecount)    # count linear extensions of a PO
+  library(partitions) # used by dimension functions
+  
+  setwd(getwd())
+  
+  source(file="pofun.R")
+  source(file="pofun_aux.R")
+  source(file="modelfun.R")
+  source(file="dimfun.R")
+  source(file="my_code.R")
+  source(file="code data.R")
+})
+
+
+ham.dist.30.all <- parLapply(cl, 1:10, function(j){
+  
+  q.consensus.30 <- vector("list",8)
+  pos.po.30 <- vector("list",8)
+  ham.dist.30 <- numeric(8)
+  
+  for (i in 1:8){
+    chain.30 <- rposterior.bucket(n=n, b=buckets.30[1:(5*i)], n.samples=n.samples, burn=burn, thin=thin, draw=F, return.lsm=T, r=.5, noise.prob=p)
+    pos.po.30[[i]] <- mean.po(chain.30$samples)
+    q.consensus.30[[i]] <- consensus.po2(pos.po.30[[i]],p=0.5)
+    ham.dist.30[i] <- hamming.dist(q.consensus.30[[i]],true.po.30)
+  }
+  
+  ham.dist.30
+})
+
+stopCluster(cl)
+
+ham.dist.30.all <- do.call(rbind,ham.dist.30.all)
+```
+
+Relative hamming dist vs N plots
+```{r}
+N.values <- 5*(1:8)
+
+mean.10 <- apply(ham.dist.10.all,2,mean)/(10*9/2+sum(true.po.10))
+se.10 <- apply(ham.dist.10.all,2,sd)/(sqrt(10)*(10*9/2+sum(true.po.10)))
+ci.10 <- qt(.975,9)*se.10
+
+mean.20 <- apply(ham.dist.20.all,2,mean)/(20*19/2+sum(true.po.20))
+se.20 <- apply(ham.dist.20.all,2,sd)/(sqrt(10)*(20*19/2+sum(true.po.20)))
+ci.20 <- qt(.975,9)*se.20
+
+mean.30 <- apply(ham.dist.30.all,2,mean)/(30*29/2+sum(true.po.30))
+se.30 <- apply(ham.dist.30.all,2,sd)/(sqrt(10)*(30*29/2+sum(true.po.30)))
+ci.30 <- qt(.975,9)*se.30
+
+jpeg("relative_hamming_distance.jpeg",width=1800,height=1200,res=200)
+
+plot(N.values,mean.10,type="b",pch=16,col="red",ylim=range(c(mean.10-ci.10,mean.10+ci.10,mean.20-ci.20,mean.20+ci.20,mean.30-ci.30,mean.30+ci.30)),xlab="N",ylab="Relative Hamming distance")
+arrows(N.values,mean.10-ci.10,N.values,mean.10+ci.10,angle=90,code=3,length=.05,col="red")
+
+lines(N.values,mean.20,type="b",pch=17,col="blue")
+arrows(N.values,mean.20-ci.20,N.values,mean.20+ci.20,angle=90,code=3,length=.05,col="blue")
+
+lines(N.values,mean.30,type="b",pch=15,col="darkgreen")
+arrows(N.values,mean.30-ci.30,N.values,mean.30+ci.30,angle=90,code=3,length=.05,col="darkgreen")
+
+legend("topright",legend=c("m = 10","m = 20","m = 30"),pch=c(16,17,15),lty=1,col=c("red","blue","darkgreen"))
+
+dev.off()
+```
+
+
+
+Chains that target an empty a total order, 8 each
+```{r}
+#8 chains targeting the empty po, m=24
+n <- 24L; N <- 30; burn <- 1e5; thin <- 1; n.samples <- 1e6; p <- 0.05
+
+cl <- makeCluster(10)
+
+clusterExport(cl, c("n","N","burn","thin","n.samples","p","buckets.emp","empty.po"))
+
+clusterEvalQ(cl, {
+  library(MASS)
+  library(mnem)       # needed for transitive.reduction/closure
+  library(igraph) 
+  library(Rgraphviz)
+  library(graph) 
+  library(coda)       # for MCMC output analysis
+  library(lecount)    # count linear extensions of a PO
+  library(partitions) # used by dimension functions
+  
+  setwd(getwd())
+  
+  source(file="pofun.R")
+  source(file="pofun_aux.R")
+  source(file="modelfun.R")
+  source(file="dimfun.R")
+  source(file="my_code.R")
+  source(file="code data.R")
+})
+
+
+ham.dist.emp.all <- parLapply(cl, 1:10, function(j){
+  
+  q.consensus.emp <- vector("list",8)
+  pos.po.emp <- vector("list",8)
+  ham.dist.emp <- numeric(8)
+  
+  for (i in 1:8){
+    m0 <- rZPO(n)
+    chain.emp <- rposterior.bucket.mean(n=n, b=buckets.emp, n.samples=n.samples, burn=burn, thin=thin, draw=F, return.lsm=T, r=.5, noise.prob=p,m=m0)
+    pos.po.emp[[i]] <- chain.emp$mean
+    q.consensus.emp[[i]] <- consensus.po2(pos.po.emp[[i]],p=0.5)
+    ham.dist.emp[i] <- hamming.dist(q.consensus.emp[[i]],empty.po)
+  }
+  
+  ham.dist.emp
+})
+
+stopCluster(cl)
+
+ham.dist.emp.all <- do.call(rbind,ham.dist.emp.all)
+
+#8 chains targeting 1:24, m=24
+n <- 24L; N <- 30; burn <- 1e5; thin <- 1; n.samples <- 1e6; p <- 0.05
+
+cl <- makeCluster(10)
+
+clusterExport(cl, c("n","N","burn","thin","n.samples","p","buckets.total","total.order"))
+
+clusterEvalQ(cl, {
+  library(MASS)
+  library(mnem)       # needed for transitive.reduction/closure
+  library(igraph) 
+  library(Rgraphviz)
+  library(graph) 
+  library(coda)       # for MCMC output analysis
+  library(lecount)    # count linear extensions of a PO
+  library(partitions) # used by dimension functions
+  
+  setwd(getwd())
+  
+  source(file="pofun.R")
+  source(file="pofun_aux.R")
+  source(file="modelfun.R")
+  source(file="dimfun.R")
+  source(file="my_code.R")
+  source(file="code data.R")
+})
+
+
+ham.dist.total.all <- parLapply(cl, 1:10, function(j){
+  
+  q.consensus.total <- vector("list",8)
+  pos.po.total <- vector("list",8)
+  ham.dist.total <- numeric(8)
+  
+  for (i in 1:8){
+    m0 <- rZPO(n)
+    chain.total <- rposterior.bucket.mean(n=n, b=buckets.total, n.samples=n.samples, burn=burn, thin=thin, draw=F, return.lsm=T, r=.5, noise.prob=p,m=m0)
+    pos.po.total[[i]] <- chain.total$mean
+    q.consensus.total[[i]] <- consensus.po2(pos.po.total[[i]],p=0.5)
+    ham.dist.total[i] <- hamming.dist(q.consensus.total[[i]],total.order)
+  }
+  
+  ham.dist.total
+})
+
+stopCluster(cl)
+
+ham.dist.total.all <- do.call(rbind,ham.dist.total.all)
+```
+
+Figures about the chains targeting the empty order and total order 
+```{r}
+mean(ham.dist.emp.all)
+qt(.95,df=80-1)*sd(ham.dist.emp.all)/sqrt(80)
+
+mean(ham.dist.total.all)
+qt(.95,df=80-1)*sd(ham.dist.total.all)/sqrt(80)
+
+mean(ham.dist.emp.all)/23/12
+qt(.95,df=80-1)*sd(ham.dist.emp.all)/sqrt(80)/23/12
+
+mean(ham.dist.total.all)/23/24
+qt(.95,df=80-1)*sd(ham.dist.total.all)/sqrt(80)/23/24
+
+mean.shallow <- mean(relations[1:5])
+ci.shallow <- qt(.975,4)*sd(relations[1:5])/sqrt(5)
+
+mean.high <- mean(relations[6:10])
+ci.high <- qt(.975,4)*sd(relations[6:10])/sqrt(5)
+
+mean.shallow
+ci.shallow
+
+mean.high
+ci.high
+```
+
+Plots of .5-consensus of chain targeting total order and empty order
+```{r}
+showDAG(q.consensus.total[[1]],vertex.color="white",vertex.size=10,edge.arrow.size=0.5)
+
+showDAG(q.consensus.emp[[1]],vertex.color="white",vertex.size=10,edge.arrow.size=0.5)
+```
+
+
+4.4 Primate data
+```{r}
+set.seed(10)
+
+results4 <- vector("list",8)
+time.taken <- numeric(8)
+mean.order <- vector("list",8)
+
+library(parallel)
+
+cl <- makeCluster(8)
+
+
+# load libraries and source files on each worker
+clusterEvalQ(cl, {
+  library(MASS)
+  library(mnem)       # needed for transitive.reduction/closure
+  library(igraph) 
+  library(Rgraphviz)
+  library(graph) 
+  library(coda)       # for MCMC output analysis
+  library(lecount)    # count linear extensions of a PO
+  library(partitions) # used by dimension functions
+  
+  setwd(getwd())
+  
+  source(file="pofun.R")
+  source(file="pofun_aux.R")
+  source(file="modelfun.R")
+  source(file="dimfun.R")
+  source(file="my_code.R")
+})
+
+
+# independent random-number streams
+clusterSetRNGStream(cl, 10)
+
+n <- 24L; N <- 30; burn <- 1e5; thin <- 1; n.samples <- 1e6; noise.prob <- .05
+#m <- code1.m
+#mc <- my.transitive.closure(m); true.po <- mc;
+#b <- rgeom.bucket.from.po(mc,n.samples = N,p=.5,suborder=T); 
+#b.mc <- bucket2mc.full(b,20)
+
+clusterExport(cl, c(
+  "n",
+  "N",
+  "burn",
+  "thin",
+  "n.samples",
+  "b.primates",
+  "noise.prob"
+))
+
+results4 <- parLapply(cl, 1:8, function(i){
+  
+  
+  m <- rZPO(24)
+  mean.i <- rposterior.bucket.mean(n=n, b=b.primates, n.samples=n.samples, burn=burn, thin=thin, draw=F, return.lsm = T, r=.5, m=m, noise.prob = noise.prob) 
+  
+  mean.i
+  
+})
+
+
+```
+
+Analyzing the primates mcmc
+```{r}
+#dissimilarity matrix records the pairwise Hamming distance between the 8 .5-consensus partial order from the primate simulations
+consensus <- vector("list",8)
+
+for (i in 1:8){
+  consensus[[i]] <- consensus.po2(results4[[i]]$mean,p=.5)
+}
+
+dissimilarity <- matrix(0,8,8)
+
+for (i in 1:8){
+  for (j in 1:8){
+    dissimilarity[i,j] <- hamming.dist(consensus[[i]],consensus[[j]])
+  }
+}
+
+dissimilarity
+rowSums(dissimilarity)
+
+
+#primate ranking
+for (i in 1:8) {
+  primate.cons <- transitive.reduction(consensus.po2(results4[[i]]$mean,p=.5))
+  primate.names <- c("Pan","Pongo","Gorilla","Hylobates","Presbytis","Macaca","Mandrillus","Cercopithecus","Papio","Cercocebus","Miopithecus","Ateles","Aotus","Lagothrix","Callithrix","Saimiri","Cebus","Eulemur","Nycticebus","Phaner","Varecia","Microcebus","Galago","Lemur")
+  
+  par(mar=c(5,4,4,16),xpd=NA)
+  showDAG(primate.cons,vertex.label=1:24,vertex.color="white",vertex.size=15,edge.arrow.size=.5)
+  title("Consensus Order of Primate Cognitive Rankings")
+  usr <- par("usr"); x1 <- usr[2]+.08*(usr[2]-usr[1]); x2 <- usr[2]+.32*(usr[2]-usr[1]); y <- seq(usr[4]-.12*(usr[4]-usr[3]),usr[3]+.12*(usr[4]-usr[3]),length.out=12)
+  text(x1,y,paste(1:12,primate.names[1:12]),adj=0,cex=.65); text(x2,y,paste(13:24,primate.names[13:24]),adj=0,cex=.65); text(x1,usr[4]+.02*(usr[4]-usr[3]),"Primate key",adj=0,cex=.75,font=2)
+}
+  
+jpeg("consensus_order_primate_8.jpeg",width=1800,height=1000,res=250)
+
+i <- 8
+
+primate.cons.1 <- transitive.reduction(consensus.po2(results4[[i]]$mean,p=1/3))
+primate.cons.2 <- transitive.reduction(consensus.po2(results4[[i]]$mean,p=.5))
+
+primate.names <- c("Pan","Pongo","Gorilla","Hylobates","Presbytis","Macaca","Mandrillus","Cercopithecus","Papio","Cercocebus","Miopithecus","Ateles","Aotus","Lagothrix","Callithrix","Saimiri","Cebus","Eulemur","Nycticebus","Phaner","Varecia","Microcebus","Galago","Lemur")
+
+par(mfrow=c(1,3),mar=c(2,2,1,2),xpd=NA)
+
+showDAG(primate.cons.1,vertex.label=1:24,vertex.color="white",vertex.size=15,edge.arrow.size=.5)
+
+showDAG(primate.cons.2,vertex.label=1:24,vertex.color="white",vertex.size=15,edge.arrow.size=.5)
+
+plot.new()
+usr <- par("usr")
+text(.05,.95,"Primate key",adj=0,cex=.9,font=2)
+text(.05,seq(.88,.12,length.out=12),paste(1:12,primate.names[1:12]),adj=0,cex=.75)
+text(.55,seq(.88,.12,length.out=12),paste(13:24,primate.names[13:24]),adj=0,cex=.75)
+
+dev.off()
+```
+
+4.3. code finding how number of edges in h0 affects the shape of the hamming dist
+```{r}
+n <- 24L; N <- 30; burn <- 1e5; thin <- 1; n.samples <- 1e6; p <- 0.05
+
+cl <- makeCluster(10)
+
+clusterExport(cl, c("n","N","burn","thin","n.samples","p","buckets.emp","empty.po"))
+
+clusterEvalQ(cl, {
+  library(MASS)
+  library(mnem)
+  library(igraph) 
+  library(Rgraphviz)
+  library(graph) 
+  library(coda)
+  library(lecount)
+  library(partitions)
+  
+  setwd(getwd())
+  
+  source(file="pofun.R")
+  source(file="pofun_aux.R")
+  source(file="modelfun.R")
+  source(file="dimfun.R")
+  source(file="my_code.R")
+  source(file="code data.R")
+})
+
+clusterSetRNGStream(cl,10)
+
+mean.dep <- parLapply(cl, 1:10, function(j){
+  
+  if (j <= 5){
+    repeat {
+      m0 <- rZPO(n)
+      if (dag.depth(m0,n) <= 7) break
+    }
+  } else {
+    repeat {
+      m0 <- rZPO(n)
+      if (dag.depth(m0,n) >= 17) break
+    }
+  }
+  
+  buckets.emp <- rgeom.bucket.from.po(m0,n.samples = N,p=.5,suborder=T,noise.prob = p)
+  
+  chain.emp <- rposterior.bucket.mean(n=n, b=buckets.emp, n.samples=n.samples, burn=burn, thin=thin, draw=F, return.lsm=T, r=.5, noise.prob=p, m=m0)
+  
+  list(
+    target=m0,
+    mean=chain.emp$mean
+  )
+  
+})
+
+stopCluster(cl)
+
+
+q.consensus.dep <- vector("list",10)
+ham.dist.dep <- matrix(NA,10,101)
+
+for (i in 1:10){
+  
+  q.consensus.dep[[i]] <- consensus.po2(mean.dep[[i]]$mean,p=0.5)
+  
+  for (j in 0:100){
+    q.consensus <- consensus.po2(mean.dep[[i]]$mean,p=j/100)
+    ham.dist.dep[i,j+1] <- hamming.dist(q.consensus,mean.dep[[i]]$target)
+  }
+}
+
+```
+
+Plots of Hamming dist against q on diff number of edges
+```{r}
+p.values <- (0:100)/100
+
+ham.dist.dep.rel <- matrix(NA,10,101)
+
+for (i in 1:10){
+  m0 <- mean.dep[[i]]$target
+  max.ham <- n*(n-1)/2 + sum(m0)
+  ham.dist.dep.rel[i,] <- ham.dist.dep[i,]/max.ham
+}
+
+
+jpeg("relative_hamming_shallow_depth.jpeg",width=1800,height=1200,res=200)
+
+plot(p.values,ham.dist.dep.rel[1,],type="l",xlab="q",ylab="Relative Hamming distance",ylim=range(ham.dist.dep.rel[1:5,],na.rm=T),col=1)
+
+for (i in 2:5){
+  lines(p.values,ham.dist.dep.rel[i,],col=i)
+}
+
+dev.off()
+
+
+jpeg("relative_hamming_high_depth.jpeg",width=1800,height=1200,res=200)
+
+plot(p.values,ham.dist.dep.rel[6,],type="l",xlab="q",ylab="Relative Hamming distance",ylim=range(ham.dist.dep.rel[6:10,],na.rm=T),col=1)
+
+for (i in 7:10){
+  lines(p.values,ham.dist.dep.rel[i,],col=i-5)
+}
+
+dev.off()
+```
+
+```{r}
+save(mean.dep,ham.dist.dep,ham.dist.dep.rel,relations,results4,
+     file="posim_results.RData")
+```
+
